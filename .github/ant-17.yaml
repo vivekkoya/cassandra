@@ -5,9 +5,9 @@ name: Java CI
 
 on:
   push:
-    branches: [ "trunk" ]
+    branches: [ "5.0.3-class-cast-exception" ]
   pull_request:
-    branches: [ "trunk" ]
+    branches: [ "5.0.3-class-cast-exception" ]
 
 jobs:
   build:
