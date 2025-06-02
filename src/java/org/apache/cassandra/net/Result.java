@@ -20,6 +20,9 @@ package org.apache.cassandra.net;
 
 import io.netty.channel.Channel;
 
+/**
+Refactored Result class into separate file
+*/
 public class Result<SuccessType extends Result.Success> {
 
     /**
