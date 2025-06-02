@@ -18,6 +18,18 @@
 
 package org.apache.cassandra.distributed.impl;
 
+import static java.util.stream.Stream.of;
+import static org.apache.cassandra.distributed.impl.IsolatedExecutor.DEFAULT_SHUTDOWN_EXECUTOR;
+import static org.apache.cassandra.distributed.shared.NetworkTopology.addressAndPort;
+import static org.apache.cassandra.utils.Shared.Recursive.ALL;
+import static org.apache.cassandra.utils.Shared.Recursive.NONE;
+import static org.apache.cassandra.utils.Shared.Scope.ANY;
+import static org.apache.cassandra.utils.concurrent.Condition.newOneTimeCondition;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Throwables;
+import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.LinkedHashMultimap;
 import java.io.IOException;
 import java.lang.annotation.Annotation;
 import java.lang.reflect.Constructor;
@@ -54,15 +66,6 @@ import java.util.stream.IntStream;
 import java.util.stream.Stream;
 import javax.annotation.Nullable;
 import javax.annotation.concurrent.GuardedBy;
-
-import com.google.common.annotations.VisibleForTesting;
-import com.google.common.base.Throwables;
-import com.google.common.collect.ImmutableSet;
-import com.google.common.collect.LinkedHashMultimap;
-import org.junit.Assume;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 import org.apache.cassandra.concurrent.ExecutorFactory;
 import org.apache.cassandra.config.CassandraRelevantProperties;
 import org.apache.cassandra.dht.IPartitioner;
@@ -100,18 +103,13 @@ import org.apache.cassandra.utils.Isolated;
 import org.apache.cassandra.utils.Shared;
 import org.apache.cassandra.utils.Shared.Recursive;
 import org.apache.cassandra.utils.concurrent.Condition;
+import org.junit.Assume;
 import org.reflections.Reflections;
 import org.reflections.scanners.Scanners;
 import org.reflections.util.ConfigurationBuilder;
 import org.reflections.util.NameHelper;
-
-import static java.util.stream.Stream.of;
-import static org.apache.cassandra.distributed.impl.IsolatedExecutor.DEFAULT_SHUTDOWN_EXECUTOR;
-import static org.apache.cassandra.distributed.shared.NetworkTopology.addressAndPort;
-import static org.apache.cassandra.utils.Shared.Recursive.ALL;
-import static org.apache.cassandra.utils.Shared.Recursive.NONE;
-import static org.apache.cassandra.utils.Shared.Scope.ANY;
-import static org.apache.cassandra.utils.concurrent.Condition.newOneTimeCondition;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * AbstractCluster creates, initializes and manages Cassandra instances ({@link Instance}.
@@ -137,17 +135,24 @@ import static org.apache.cassandra.utils.concurrent.Condition.newOneTimeConditio
  * handlers for internode to have more control over it. Messaging is wired by passing verbs manually.
  * coordinator-handling code and hooks to the callbacks can be found in {@link Coordinator}.
  */
-public abstract class AbstractCluster<I extends IInstance> implements ICluster<I>, AutoCloseable
-{
-    public static Versions.Version CURRENT_VERSION = new Versions.Version(FBUtilities.getReleaseVersionString(), Versions.getClassPath());
+public abstract class AbstractCluster<I extends IInstance>
+    implements ICluster<I>, AutoCloseable {
+
+    public static Versions.Version CURRENT_VERSION = new Versions.Version(
+        FBUtilities.getReleaseVersionString(),
+        Versions.getClassPath()
+    );
 
     // WARNING: we have this logger not (necessarily) for logging, but
     // to ensure we have instantiated the main classloader's LoggerFactory (and any LogbackStatusListener)
     // before we instantiate any for a new instance
-    private static final Logger logger = LoggerFactory.getLogger(AbstractCluster.class);
+    private static final Logger logger = LoggerFactory.getLogger(
+        AbstractCluster.class
+    );
 
     // include byteman so tests can use
-    public static final Predicate<String> SHARED_PREDICATE = getSharedClassPredicate(ANY);
+    public static final Predicate<String> SHARED_PREDICATE =
+        getSharedClassPredicate(ANY);
 
     private final UUID clusterId = UUID.randomUUID();
     private final Path root;
@@ -172,10 +177,14 @@ public abstract class AbstractCluster<I extends IInstance> implements ICluster<I
     private final INodeProvisionStrategy.Factory nodeProvisionStrategy;
     private final IInstanceInitializer instanceInitializer;
     private final int datadirCount;
-    private volatile BiPredicate<Integer, Throwable> ignoreUncaughtThrowable = null;
-    private final List<Throwable> uncaughtExceptions = new CopyOnWriteArrayList<>();
+    private volatile BiPredicate<Integer, Throwable> ignoreUncaughtThrowable =
+        null;
+    private final List<Throwable> uncaughtExceptions =
+        new CopyOnWriteArrayList<>();
 
-    private final ThreadGroup clusterThreadGroup = new ThreadGroup(clusterId.toString());
+    private final ThreadGroup clusterThreadGroup = new ThreadGroup(
+        clusterId.toString()
+    );
     private final ShutdownExecutor shutdownExecutor;
 
     private volatile IMessageSink messageSink;
@@ -183,10 +192,19 @@ public abstract class AbstractCluster<I extends IInstance> implements ICluster<I
     /**
      * Common builder, add methods that are applicable to both Cluster and Upgradable cluster here.
      */
-    public static abstract class AbstractBuilder<I extends IInstance, C extends ICluster, B extends AbstractBuilder<I, C, B>>
-        extends org.apache.cassandra.distributed.shared.AbstractBuilder<I, C, B>
-    {
-        private INodeProvisionStrategy.Factory nodeProvisionStrategy = INodeProvisionStrategy.Strategy.MultipleNetworkInterfaces;
+    public abstract static class AbstractBuilder<
+        I extends IInstance,
+        C extends ICluster,
+        B extends AbstractBuilder<I, C, B>
+    >
+        extends org.apache.cassandra.distributed.shared.AbstractBuilder<
+            I,
+            C,
+            B
+        > {
+
+        private INodeProvisionStrategy.Factory nodeProvisionStrategy =
+            INodeProvisionStrategy.Strategy.MultipleNetworkInterfaces;
         private ShutdownExecutor shutdownExecutor = DEFAULT_SHUTDOWN_EXECUTOR;
         private boolean dynamicPortAllocation = false;
 
@@ -196,52 +214,70 @@ public abstract class AbstractCluster<I extends IInstance> implements ICluster<I
             // those properties may be set for unit-test optimizations; those should not be used when running dtests
             CassandraRelevantProperties.TEST_FLUSH_LOCAL_SCHEMA_CHANGES.reset();
             CassandraRelevantProperties.NON_GRACEFUL_SHUTDOWN.reset();
-            CassandraRelevantProperties.IO_NETTY_TRANSPORT_NONATIVE.setBoolean(false);
+            CassandraRelevantProperties.IO_NETTY_TRANSPORT_NONATIVE.setBoolean(
+                false
+            );
             withInstanceInitializer((classLoader, threadGroup, i, i1) -> {
-                try
-                {
-                    Class<?> ef = classLoader.loadClass(ExecutorFactory.class.getName());
-                    Class<?> efd = classLoader.loadClass(ExecutorFactory.Default.class.getName());
-                    Constructor<?> newEfd = efd.getConstructor(ClassLoader.class, ThreadGroup.class, Thread.UncaughtExceptionHandler.class);
-                    Object executorFactory = newEfd.newInstance(classLoader, threadGroup, threadGroup);
-                    Class<?> efg = classLoader.loadClass(ExecutorFactory.Global.class.getName());
+                try {
+                    Class<?> ef = classLoader.loadClass(
+                        ExecutorFactory.class.getName()
+                    );
+                    Class<?> efd = classLoader.loadClass(
+                        ExecutorFactory.Default.class.getName()
+                    );
+                    Constructor<?> newEfd = efd.getConstructor(
+                        ClassLoader.class,
+                        ThreadGroup.class,
+                        Thread.UncaughtExceptionHandler.class
+                    );
+                    Object executorFactory = newEfd.newInstance(
+                        classLoader,
+                        threadGroup,
+                        threadGroup
+                    );
+                    Class<?> efg = classLoader.loadClass(
+                        ExecutorFactory.Global.class.getName()
+                    );
                     Method setEfg = efg.getMethod("unsafeSet", ef);
                     setEfg.invoke(null, executorFactory);
-                }
-                catch (ClassNotFoundException e)
-                {
-                    if (this instanceof Cluster.Builder)
-                        throw new RuntimeException(e);
-                    else
-                        logger.info("Unable to set ExecutorFactory for instance {}", i, e);
-                }
-                catch (NoSuchMethodException | InvocationTargetException | InstantiationException | IllegalAccessException e)
-                {
+                } catch (ClassNotFoundException e) {
+                    if (
+                        this instanceof Cluster.Builder
+                    ) throw new RuntimeException(e);
+                    else logger.info(
+                        "Unable to set ExecutorFactory for instance {}",
+                        i,
+                        e
+                    );
+                } catch (
+                    NoSuchMethodException
+                    | InvocationTargetException
+                    | InstantiationException
+                    | IllegalAccessException e
+                ) {
                     throw new RuntimeException(e);
                 }
             });
         }
 
-        public AbstractBuilder(Factory<I, C, B> factory)
-        {
+        public AbstractBuilder(Factory<I, C, B> factory) {
             super(factory);
             withSharedClasses(SHARED_PREDICATE);
         }
 
         @SuppressWarnings("unchecked")
-        private B self()
-        {
+        private B self() {
             return (B) this;
         }
 
-        public B withNodeProvisionStrategy(INodeProvisionStrategy.Factory nodeProvisionStrategy)
-        {
+        public B withNodeProvisionStrategy(
+            INodeProvisionStrategy.Factory nodeProvisionStrategy
+        ) {
             this.nodeProvisionStrategy = nodeProvisionStrategy;
             return self();
         }
 
-        public B withShutdownExecutor(ShutdownExecutor shutdownExecutor)
-        {
+        public B withShutdownExecutor(ShutdownExecutor shutdownExecutor) {
             this.shutdownExecutor = shutdownExecutor;
             return self();
         }
@@ -256,71 +292,76 @@ public abstract class AbstractCluster<I extends IInstance> implements ICluster<I
          *                              allocation
          * @return a reference to this Builder
          */
-        public B withDynamicPortAllocation(boolean dynamicPortAllocation)
-        {
+        public B withDynamicPortAllocation(boolean dynamicPortAllocation) {
             this.dynamicPortAllocation = dynamicPortAllocation;
             return self();
         }
 
         @Override
-        public C createWithoutStarting() throws IOException
-        {
+        public C createWithoutStarting() throws IOException {
             // if running as vnode but test sets withoutVNodes(), then skip the test
             // AbstractCluster.createInstanceConfig has similar logic, but handles the cases where the test
             // attempts to control tokens via config
             // when token supplier is defined, use getTokenCount() to see if vnodes is supported or not
-            if (isVnode())
-            {
+            if (isVnode()) {
                 Assume.assumeTrue("vnode is not supported", isVNodeAllowed());
                 // if token count > 1 and isVnode, then good
-                Assume.assumeTrue("no-vnode is requested but not supported", getTokenCount() > 1);
-            }
-            else
-            {
-                Assume.assumeTrue("single-token is not supported", isSingleTokenAllowed());
+                Assume.assumeTrue(
+                    "no-vnode is requested but not supported",
+                    getTokenCount() > 1
+                );
+            } else {
+                Assume.assumeTrue(
+                    "single-token is not supported",
+                    isSingleTokenAllowed()
+                );
                 // if token count == 1 and isVnode == false, then goodAbstractClusterTest
-                Assume.assumeTrue("vnode is requested but not supported", getTokenCount() == 1);
+                Assume.assumeTrue(
+                    "vnode is requested but not supported",
+                    getTokenCount() == 1
+                );
             }
 
             return super.createWithoutStarting();
         }
 
-        private boolean isVnode()
-        {
+        private boolean isVnode() {
             TokenSupplier ts = getTokenSupplier();
             return ts == null
-                   ? getTokenCount() > 1 // token supplier wasn't defined yet, so rely on getTokenCount()
-                   : ts.tokens(1).size() > 1; // token supplier is defined... check the first instance to see what tokens are used
+                ? getTokenCount() > 1 // token supplier wasn't defined yet, so rely on getTokenCount()
+                : ts.tokens(1).size() > 1; // token supplier is defined... check the first instance to see what tokens are used
         }
     }
 
-    protected class Wrapper extends DelegatingInvokableInstance implements IUpgradeableInstance
-    {
+    protected class Wrapper
+        extends DelegatingInvokableInstance
+        implements IUpgradeableInstance {
+
         private final IInstanceConfig config;
         private volatile IInvokableInstance delegate;
         private volatile Versions.Version version;
+
         @GuardedBy("this")
         private volatile boolean isShutdown = true;
+
         @GuardedBy("this")
         private InetSocketAddress broadcastAddress;
+
         private int generation = -1;
 
-        protected IInvokableInstance delegate()
-        {
-            if (delegate == null)
-                throw new IllegalStateException("Can't use shutdown node" + config.num() + ", delegate is null");
+        protected IInvokableInstance delegate() {
+            if (delegate == null) throw new IllegalStateException(
+                "Can't use shutdown node" + config.num() + ", delegate is null"
+            );
             return delegate;
         }
 
-        protected IInvokableInstance delegateForStartup()
-        {
-            if (delegate == null)
-                delegate = newInstance();
+        protected IInvokableInstance delegateForStartup() {
+            if (delegate == null) delegate = newInstance();
             return delegate;
         }
 
-        public Wrapper(Versions.Version version, IInstanceConfig config)
-        {
+        public Wrapper(Versions.Version version, IInstanceConfig config) {
             this.config = config;
             this.version = version;
             // we ensure there is always a non-null delegate, so that the executor may be used while the node is offline
@@ -328,107 +369,139 @@ public abstract class AbstractCluster<I extends IInstance> implements ICluster<I
             this.broadcastAddress = config.broadcastAddress();
         }
 
-        private IInvokableInstance newInstance()
-        {
+        private IInvokableInstance newInstance() {
             ++generation;
-            IClassTransformer transformer = classTransformer == null ? null : classTransformer.initialise();
-            ClassLoader classLoader = new InstanceClassLoader(generation, config.num(), version.classpath, sharedClassLoader, sharedClassPredicate, transformer);
-            ThreadGroup threadGroup = new ThreadGroup(clusterThreadGroup, "node" + config.num() + (generation > 1 ? "_" + generation : ""))
-            {
+            IClassTransformer transformer = classTransformer == null
+                ? null
+                : classTransformer.initialise();
+            ClassLoader classLoader = new InstanceClassLoader(
+                generation,
+                config.num(),
+                version.classpath,
+                sharedClassLoader,
+                sharedClassPredicate,
+                transformer
+            );
+            ThreadGroup threadGroup = new ThreadGroup(
+                clusterThreadGroup,
+                "node" + config.num() + (generation > 1 ? "_" + generation : "")
+            ) {
                 @Override
-                public void uncaughtException(Thread t, Throwable e)
-                {
-                    AbstractCluster.this.uncaughtException(get(config.num()), t, e);
+                public void uncaughtException(Thread t, Throwable e) {
+                    AbstractCluster.this.uncaughtException(
+                            get(config.num()),
+                            t,
+                            e
+                        );
                 }
             };
-            if (instanceInitializer != null)
-                instanceInitializer.initialise(classLoader, threadGroup, config.num(), generation);
+            if (instanceInitializer != null) instanceInitializer.initialise(
+                classLoader,
+                threadGroup,
+                config.num(),
+                generation
+            );
 
             IInvokableInstance instance;
-            try
-            {
-                instance = Instance.transferAdhocPropagate((SerializableQuadFunction<IInstanceConfig, ClassLoader, FileSystem, ShutdownExecutor, Instance>)Instance::new, classLoader)
-                                   .apply(config.forVersion(version.version), classLoader, root.getFileSystem(), shutdownExecutor);
-            }
-            catch (InvocationTargetException e)
-            {
-                try
-                {
-                    instance = Instance.transferAdhocPropagate((SerializableTriFunction<IInstanceConfig, ClassLoader, FileSystem, Instance>)Instance::new, classLoader)
-                                       .apply(config.forVersion(version.version), classLoader, root.getFileSystem());
-                }
-                catch (InvocationTargetException e2)
-                {
-                    instance = Instance.transferAdhoc((SerializableBiFunction<IInstanceConfig, ClassLoader, Instance>)Instance::new, classLoader)
-                                       .apply(config.forVersion(version.version), classLoader);
-                }
-                catch (IllegalAccessException e2)
-                {
+            try {
+                instance = Instance.transferAdhocPropagate(
+                    (SerializableQuadFunction<
+                            IInstanceConfig,
+                            ClassLoader,
+                            FileSystem,
+                            ShutdownExecutor,
+                            Instance
+                        >) Instance::new,
+                    classLoader
+                ).apply(
+                    config.forVersion(version.version),
+                    classLoader,
+                    root.getFileSystem(),
+                    shutdownExecutor
+                );
+            } catch (InvocationTargetException e) {
+                try {
+                    instance = Instance.transferAdhocPropagate(
+                        (SerializableTriFunction<
+                                IInstanceConfig,
+                                ClassLoader,
+                                FileSystem,
+                                Instance
+                            >) Instance::new,
+                        classLoader
+                    ).apply(
+                        config.forVersion(version.version),
+                        classLoader,
+                        root.getFileSystem()
+                    );
+                } catch (InvocationTargetException e2) {
+                    instance = Instance.transferAdhoc(
+                        (SerializableBiFunction<
+                                IInstanceConfig,
+                                ClassLoader,
+                                Instance
+                            >) Instance::new,
+                        classLoader
+                    ).apply(config.forVersion(version.version), classLoader);
+                } catch (IllegalAccessException e2) {
                     throw new RuntimeException(e);
                 }
-            }
-            catch (IllegalAccessException e)
-            {
+            } catch (IllegalAccessException e) {
                 throw new RuntimeException(e);
             }
 
-            if (instanceInitializer != null)
-                instanceInitializer.beforeStartup(instance);
+            if (instanceInitializer != null) instanceInitializer.beforeStartup(
+                instance
+            );
 
             return instance;
         }
 
-        public Executor executorFor(int verb)
-        {
-            if (isShutdown)
-                throw new IllegalStateException();
+        public Executor executorFor(int verb) {
+            if (isShutdown) throw new IllegalStateException();
 
             // this method must be lock-free to avoid Simulator deadlock
             return delegate().executorFor(verb);
         }
 
-        public IInstanceConfig config()
-        {
+        public IInstanceConfig config() {
             return config;
         }
 
-        public boolean isShutdown()
-        {
+        public boolean isShutdown() {
             IInvokableInstance delegate = this.delegate;
             // if the instance shuts down on its own, detect that
             return isShutdown || (delegate != null && delegate.isShutdown());
         }
 
-        private boolean isRunning()
-        {
+        private boolean isRunning() {
             return !isShutdown();
         }
 
         @Override
-        public boolean isValid()
-        {
+        public boolean isValid() {
             return delegate != null;
         }
 
         @Override
-        public synchronized void startup()
-        {
+        public synchronized void startup() {
             startup(AbstractCluster.this);
             postStartup();
         }
 
-        public synchronized void startup(ICluster cluster)
-        {
-            if (cluster != AbstractCluster.this)
-                throw new IllegalArgumentException("Only the owning cluster can be used for startup");
-            if (isRunning())
-                throw new IllegalStateException("Can not start a instance that is already running");
+        public synchronized void startup(ICluster cluster) {
+            if (
+                cluster != AbstractCluster.this
+            ) throw new IllegalArgumentException(
+                "Only the owning cluster can be used for startup"
+            );
+            if (isRunning()) throw new IllegalStateException(
+                "Can not start a instance that is already running"
+            );
             isShutdown = false;
             // if the delegate isn't running, remove so it can be recreated
-            if (delegate != null && delegate.isShutdown())
-                delegate = null;
-            if (!broadcastAddress.equals(config.broadcastAddress()))
-            {
+            if (delegate != null && delegate.isShutdown()) delegate = null;
+            if (!broadcastAddress.equals(config.broadcastAddress())) {
                 // previous address != desired address, so cleanup
                 InetSocketAddress previous = broadcastAddress;
                 InetSocketAddress newAddress = config.broadcastAddress();
@@ -438,26 +511,27 @@ public abstract class AbstractCluster<I extends IInstance> implements ICluster<I
                 // remove delegate to make sure static state is reset
                 delegate = null;
             }
-            try
-            {
+            try {
                 delegateForStartup().startup(cluster);
-            }
-            catch (Throwable t)
-            {
-                if (config.get(Constants.KEY_DTEST_API_STARTUP_FAILURE_AS_SHUTDOWN) == null)
-                {
+            } catch (Throwable t) {
+                if (
+                    config.get(
+                        Constants.KEY_DTEST_API_STARTUP_FAILURE_AS_SHUTDOWN
+                    ) ==
+                    null
+                ) {
                     // its possible that the failure happens after listening and threads are started up
                     // but without knowing the start up phase it isn't safe to call shutdown, so assume
                     // that a failed to start instance was shutdown (which would be true if each instance
                     // was its own JVM).
                     isShutdown = true;
-                }
-                else
-                {
+                } else {
                     // user was explict about the desired behavior, respect it
                     // the most common reason to set this is to set 'false', this will leave the
                     // instance marked as running, which will have .close shut it down.
-                    isShutdown = (boolean) config.get(Constants.KEY_DTEST_API_STARTUP_FAILURE_AS_SHUTDOWN);
+                    isShutdown = (boolean) config.get(
+                        Constants.KEY_DTEST_API_STARTUP_FAILURE_AS_SHUTDOWN
+                    );
                 }
                 throw t;
             }
@@ -465,94 +539,91 @@ public abstract class AbstractCluster<I extends IInstance> implements ICluster<I
             // do not, so to permit older releases to be tested, repeat the setup
             updateMessagingVersions();
 
-            if (instanceInitializer != null)
-                instanceInitializer.afterStartup(this);
+            if (instanceInitializer != null) instanceInitializer.afterStartup(
+                this
+            );
         }
 
         @Override
-        public synchronized Future<Void> shutdown()
-        {
+        public synchronized Future<Void> shutdown() {
             return shutdown(true);
         }
 
         @Override
-        public synchronized Future<Void> shutdown(boolean graceful)
-        {
-            if (isShutdown())
-                throw new IllegalStateException("Instance is not running, so can not be shutdown");
+        public synchronized Future<Void> shutdown(boolean graceful) {
+            if (isShutdown()) throw new IllegalStateException(
+                "Instance is not running, so can not be shutdown"
+            );
             isShutdown = true;
             Future<Void> future = delegate.shutdown(graceful);
             delegate = null;
             return future;
         }
 
-        public int liveMemberCount()
-        {
-            if (isRunning() && delegate != null)
-                return delegate().liveMemberCount();
+        public int liveMemberCount() {
+            if (isRunning() && delegate != null) return delegate()
+                .liveMemberCount();
 
-            throw new IllegalStateException("Cannot get live member count on shutdown instance: " + config.num());
+            throw new IllegalStateException(
+                "Cannot get live member count on shutdown instance: " +
+                config.num()
+            );
         }
 
-        public Metrics metrics()
-        {
-            if (isShutdown)
-                throw new IllegalStateException();
+        public Metrics metrics() {
+            if (isShutdown) throw new IllegalStateException();
 
             return delegate.metrics();
         }
 
-        public NodeToolResult nodetoolResult(boolean withNotifications, String... commandAndArgs)
-        {
+        public NodeToolResult nodetoolResult(
+            boolean withNotifications,
+            String... commandAndArgs
+        ) {
             return delegate().nodetoolResult(withNotifications, commandAndArgs);
         }
 
-        public long killAttempts()
-        {
+        public long killAttempts() {
             IInvokableInstance local = delegate;
             // if shutdown cleared the delegate, then no longer know how many kill attempts happened, so return -1
-            if (local == null)
-                return -1;
+            if (local == null) return -1;
             return local.killAttempts();
         }
 
         @Override
-        public void receiveMessage(IMessage message)
-        {
+        public void receiveMessage(IMessage message) {
             IInvokableInstance delegate = this.delegate;
-            if (isRunning() && delegate != null) // since we sync directly on the other node, we drop messages immediately if we are shutdown
-                delegate.receiveMessage(message);
+            if (
+                isRunning() && delegate != null
+            ) delegate.receiveMessage(message); // since we sync directly on the other node, we drop messages immediately if we are shutdown
         }
 
         @Override
-        public void receiveMessageWithInvokingThread(IMessage message)
-        {
+        public void receiveMessageWithInvokingThread(IMessage message) {
             IInvokableInstance delegate = this.delegate;
-            if (isRunning() && delegate != null) // since we sync directly on the other node, we drop messages immediately if we are shutdown
-                delegate.receiveMessageWithInvokingThread(message);
+            if (
+                isRunning() && delegate != null
+            ) delegate.receiveMessageWithInvokingThread(message); // since we sync directly on the other node, we drop messages immediately if we are shutdown
         }
 
         @Override
-        public boolean getLogsEnabled()
-        {
+        public boolean getLogsEnabled() {
             return delegate().getLogsEnabled();
         }
 
         @Override
-        public LogAction logs()
-        {
+        public LogAction logs() {
             return delegate().logs();
         }
 
         @Override
-        public synchronized void setVersion(Versions.Version version)
-        {
-            if (isRunning())
-                throw new IllegalStateException("Must be shutdown before version can be modified");
+        public synchronized void setVersion(Versions.Version version) {
+            if (isRunning()) throw new IllegalStateException(
+                "Must be shutdown before version can be modified"
+            );
             // re-initialise
             this.version = version;
-            if (delegate != null)
-            {
+            if (delegate != null) {
                 // we can have a non-null delegate even thought we are shutdown, if delegate() has been invoked since shutdown.
                 delegate.shutdown();
                 delegate = null;
@@ -560,25 +631,28 @@ public abstract class AbstractCluster<I extends IInstance> implements ICluster<I
         }
 
         @Override
-        public void uncaughtException(Thread thread, Throwable throwable)
-        {
+        public void uncaughtException(Thread thread, Throwable throwable) {
             IInvokableInstance delegate = this.delegate;
-            if (delegate != null)
-                delegate.uncaughtException(thread, throwable);
-            else
-                logger.error("uncaught exception in thread {}", thread, throwable);
+            if (delegate != null) delegate.uncaughtException(thread, throwable);
+            else logger.error(
+                "uncaught exception in thread {}",
+                thread,
+                throwable
+            );
         }
 
         @Override
-        public String toString()
-        {
+        public String toString() {
             IInvokableInstance delegate = this.delegate;
-            return delegate == null ? "node" + config.num() : delegate.toString();
+            return delegate == null
+                ? "node" + config.num()
+                : delegate.toString();
         }
     }
 
-    protected AbstractCluster(AbstractBuilder<I, ? extends ICluster<I>, ?> builder)
-    {
+    protected AbstractCluster(
+        AbstractBuilder<I, ? extends ICluster<I>, ?> builder
+    ) {
         this.root = builder.getRootPath();
         this.sharedClassLoader = builder.getSharedClassLoader();
         this.sharedClassPredicate = builder.getSharedClasses();
@@ -596,62 +670,85 @@ public abstract class AbstractCluster<I extends IInstance> implements ICluster<I
         this.filters = new MessageFilters();
         this.instanceInitializer = builder.getInstanceInitializer2();
         this.datadirCount = builder.getDatadirCount();
-        this.portMap = builder.dynamicPortAllocation ? new ConcurrentHashMap<>() : null;
+        this.portMap = builder.dynamicPortAllocation
+            ? new ConcurrentHashMap<>()
+            : null;
 
-        for (int i = 0; i < builder.getNodeCount(); ++i)
-        {
+        for (int i = 0; i < builder.getNodeCount(); ++i) {
             int nodeNum = i + 1;
             InstanceConfig config = createInstanceConfig(nodeNum);
 
             I instance = newInstanceWrapperInternal(initialVersion, config);
             instances.add(instance);
             // we use the config().broadcastAddressAndPort() here because we have not initialised the Instance
-            I prev = instanceMap.put(instance.config().broadcastAddress(), instance);
-            if (null != prev)
-                throw new IllegalStateException("Cluster cannot have multiple nodes with same InetAddressAndPort: " + instance.broadcastAddress() + " vs " + prev.broadcastAddress());
+            I prev = instanceMap.put(
+                instance.config().broadcastAddress(),
+                instance
+            );
+            if (null != prev) throw new IllegalStateException(
+                "Cluster cannot have multiple nodes with same InetAddressAndPort: " +
+                instance.broadcastAddress() +
+                " vs " +
+                prev.broadcastAddress()
+            );
         }
     }
 
-    public InstanceConfig newInstanceConfig()
-    {
+    public InstanceConfig newInstanceConfig() {
         return createInstanceConfig(size() + 1);
     }
 
     @VisibleForTesting
-    InstanceConfig createInstanceConfig(int nodeNum)
-    {
-        INodeProvisionStrategy provisionStrategy = nodeProvisionStrategy.create(subnet, portMap);
+    InstanceConfig createInstanceConfig(int nodeNum) {
+        INodeProvisionStrategy provisionStrategy = nodeProvisionStrategy.create(
+            subnet,
+            portMap
+        );
         Collection<String> tokens = tokenSupplier.tokens(nodeNum);
-        NetworkTopology topology = buildNetworkTopology(provisionStrategy, nodeIdTopology);
-        InstanceConfig config = InstanceConfig.generate(nodeNum, provisionStrategy, topology, root, tokens, datadirCount);
+        NetworkTopology topology = buildNetworkTopology(
+            provisionStrategy,
+            nodeIdTopology
+        );
+        InstanceConfig config = InstanceConfig.generate(
+            nodeNum,
+            provisionStrategy,
+            topology,
+            root,
+            tokens,
+            datadirCount
+        );
         config.set(Constants.KEY_DTEST_API_CLUSTER_ID, clusterId.toString());
         // if a test sets num_tokens directly, then respect it and only run if vnode or no-vnode is defined
         int defaultTokenCount = config.getInt("num_tokens");
-        assert tokens.size() == defaultTokenCount : String.format("num_tokens=%d but tokens are %s; size does not match", defaultTokenCount, tokens);
+        assert tokens.size() == defaultTokenCount : String.format(
+            "num_tokens=%d but tokens are %s; size does not match",
+            defaultTokenCount,
+            tokens
+        );
         String defaultTokens = config.getString("initial_token");
-        if (configUpdater != null)
-        {
+        if (configUpdater != null) {
             configUpdater.accept(config);
             int testTokenCount = config.getInt("num_tokens");
-            if (defaultTokenCount != testTokenCount)
-            {
-                if (testTokenCount == 1)
-                {
+            if (defaultTokenCount != testTokenCount) {
+                if (testTokenCount == 1) {
                     // test is no-vnode, but running with vnode, so skip
                     Assume.assumeTrue("vnode is not supported", false);
-                }
-                else
-                {
-                    Assume.assumeTrue("no-vnode is requested but not supported", defaultTokenCount > 1);
+                } else {
+                    Assume.assumeTrue(
+                        "no-vnode is requested but not supported",
+                        defaultTokenCount > 1
+                    );
                     // if the test controls initial_token or GOSSIP is enabled, then the test is safe to run
-                    if (defaultTokens.equals(config.getString("initial_token")))
-                    {
+                    if (
+                        defaultTokens.equals(config.getString("initial_token"))
+                    ) {
                         // test didn't define initial_token
-                        Assume.assumeTrue("vnode is enabled and num_tokens is defined in test without GOSSIP or setting initial_token", config.has(Feature.GOSSIP));
+                        Assume.assumeTrue(
+                            "vnode is enabled and num_tokens is defined in test without GOSSIP or setting initial_token",
+                            config.has(Feature.GOSSIP)
+                        );
                         config.remove("initial_token");
-                    }
-                    else
-                    {
+                    } else {
                         // test defined initial_token; trust it
                     }
                 }
@@ -660,44 +757,57 @@ public abstract class AbstractCluster<I extends IInstance> implements ICluster<I
         return config;
     }
 
-    public static NetworkTopology buildNetworkTopology(INodeProvisionStrategy provisionStrategy,
-                                                       Map<Integer, NetworkTopology.DcAndRack> nodeIdTopology)
-    {
-        NetworkTopology topology = NetworkTopology.build("", 0, Collections.emptyMap());
+    public static NetworkTopology buildNetworkTopology(
+        INodeProvisionStrategy provisionStrategy,
+        Map<Integer, NetworkTopology.DcAndRack> nodeIdTopology
+    ) {
+        NetworkTopology topology = NetworkTopology.build(
+            "",
+            0,
+            Collections.emptyMap()
+        );
 
         IntStream.rangeClosed(1, nodeIdTopology.size()).forEach(nodeId -> {
-            InetSocketAddress addressAndPort = addressAndPort(provisionStrategy.ipAddress(nodeId), provisionStrategy.storagePort(nodeId));
+            InetSocketAddress addressAndPort = addressAndPort(
+                provisionStrategy.ipAddress(nodeId),
+                provisionStrategy.storagePort(nodeId)
+            );
             NetworkTopology.DcAndRack dcAndRack = nodeIdTopology.get(nodeId);
             topology.put(addressAndPort, dcAndRack);
         });
         return topology;
     }
 
+    protected abstract I newInstanceWrapper(
+        Versions.Version version,
+        IInstanceConfig config
+    );
 
-    protected abstract I newInstanceWrapper(Versions.Version version, IInstanceConfig config);
-
-    protected I newInstanceWrapperInternal(Versions.Version version, IInstanceConfig config)
-    {
+    protected I newInstanceWrapperInternal(
+        Versions.Version version,
+        IInstanceConfig config
+    ) {
         config.validate();
         return newInstanceWrapper(version, config);
     }
 
-    public I bootstrap(IInstanceConfig config)
-    {
+    public I bootstrap(IInstanceConfig config) {
         return bootstrap(config, initialVersion);
     }
 
-    public I bootstrap(IInstanceConfig config, Versions.Version version)
-    {
+    public I bootstrap(IInstanceConfig config, Versions.Version version) {
         I instance = newInstanceWrapperInternal(version, config);
         instances.add(instance);
         I prev = instanceMap.put(config.broadcastAddress(), instance);
 
-        if (null != prev)
-        {
-            throw new IllegalStateException(String.format("This cluster already contains a node (%d) with with same address and port: %s",
-                                                          config.num(),
-                                                          instance));
+        if (null != prev) {
+            throw new IllegalStateException(
+                String.format(
+                    "This cluster already contains a node (%d) with with same address and port: %s",
+                    config.num(),
+                    instance
+                )
+            );
         }
 
         return instance;
@@ -706,167 +816,179 @@ public abstract class AbstractCluster<I extends IInstance> implements ICluster<I
     /**
      * WARNING: we index from 1 here, for consistency with inet address!
      */
-    public ICoordinator coordinator(int node)
-    {
+    public ICoordinator coordinator(int node) {
         return instances.get(node - 1).coordinator();
     }
 
-    public Stream<ICoordinator> coordinators()
-    {
+    public Stream<ICoordinator> coordinators() {
         return stream().map(IInstance::coordinator);
     }
 
-    public I firstAlive()
-    {
+    public I firstAlive() {
         return stream().filter(i -> !i.isShutdown()).findFirst().get();
     }
-    public List<I> get(int... nodes)
-    {
-        if (nodes == null || nodes.length == 0)
-            throw new IllegalArgumentException("No nodes provided");
+
+    public List<I> get(int... nodes) {
+        if (
+            nodes == null || nodes.length == 0
+        ) throw new IllegalArgumentException("No nodes provided");
         List<I> list = new ArrayList<>(nodes.length);
-        for (int i : nodes)
-            list.add(get(i));
+        for (int i : nodes) list.add(get(i));
         return list;
     }
 
     /**
      * WARNING: we index from 1 here, for consistency with inet address!
      */
-    public I get(int node)
-    {
+    public I get(int node) {
         return instances.get(node - 1);
     }
 
-    public I get(InetSocketAddress addr)
-    {
+    public I get(InetSocketAddress addr) {
         return instanceMap.get(addr);
     }
 
-    public I getFirstRunningInstance()
-    {
-        return stream().filter(i -> !i.isShutdown()).findFirst().orElseThrow(
-            () -> new IllegalStateException("All instances are shutdown"));
+    public I getFirstRunningInstance() {
+        return stream()
+            .filter(i -> !i.isShutdown())
+            .findFirst()
+            .orElseThrow(() ->
+                new IllegalStateException("All instances are shutdown")
+            );
     }
 
-    public int size()
-    {
+    public int size() {
         return instances.size();
     }
 
-    public Stream<I> stream()
-    {
+    public Stream<I> stream() {
         return instances.stream();
     }
 
-    public Stream<I> stream(String dcName)
-    {
-        return instances.stream().filter(i -> i.config().localDatacenter().equals(dcName));
+    public Stream<I> stream(String dcName) {
+        return instances
+            .stream()
+            .filter(i -> i.config().localDatacenter().equals(dcName));
     }
 
-    public Stream<I> stream(String dcName, String rackName)
-    {
-        return instances.stream().filter(i -> i.config().localDatacenter().equals(dcName) &&
-                                              i.config().localRack().equals(rackName));
+    public Stream<I> stream(String dcName, String rackName) {
+        return instances
+            .stream()
+            .filter(
+                i ->
+                    i.config().localDatacenter().equals(dcName) &&
+                    i.config().localRack().equals(rackName)
+            );
     }
 
-    public void run(Consumer<? super I> action, Predicate<I> filter)
-    {
+    public void run(Consumer<? super I> action, Predicate<I> filter) {
         run(Collections.singletonList(action), filter);
     }
 
-    public void run(Collection<Consumer<? super I>> actions, Predicate<I> filter)
-    {
-        stream().forEach(instance -> {
-            for (Consumer<? super I> action : actions)
-            {
-                if (filter.test(instance))
-                    action.accept(instance);
-            }
-
-        });
+    public void run(
+        Collection<Consumer<? super I>> actions,
+        Predicate<I> filter
+    ) {
+        stream()
+            .forEach(instance -> {
+                for (Consumer<? super I> action : actions) {
+                    if (filter.test(instance)) action.accept(instance);
+                }
+            });
     }
 
-    public void run(Consumer<? super I> action, int instanceId, int... moreInstanceIds)
-    {
+    public void run(
+        Consumer<? super I> action,
+        int instanceId,
+        int... moreInstanceIds
+    ) {
         run(Collections.singletonList(action), instanceId, moreInstanceIds);
     }
 
-    public void run(List<Consumer<? super I>> actions, int instanceId, int... moreInstanceIds)
-    {
+    public void run(
+        List<Consumer<? super I>> actions,
+        int instanceId,
+        int... moreInstanceIds
+    ) {
         int[] instanceIds = new int[moreInstanceIds.length + 1];
         instanceIds[0] = instanceId;
-        System.arraycopy(moreInstanceIds, 0, instanceIds, 1, moreInstanceIds.length);
+        System.arraycopy(
+            moreInstanceIds,
+            0,
+            instanceIds,
+            1,
+            moreInstanceIds.length
+        );
 
-        for (int idx : instanceIds)
-        {
-            for (Consumer<? super I> action : actions)
-                action.accept(this.get(idx));
+        for (int idx : instanceIds) {
+            for (Consumer<? super I> action : actions) action.accept(
+                this.get(idx)
+            );
         }
     }
 
-    public void forEach(Consumer<? super I> consumer)
-    {
+    public void forEach(Consumer<? super I> consumer) {
         forEach(instances, consumer);
     }
 
-    public void forEach(List<I> instancesForOp, Consumer<? super I> consumer)
-    {
+    public void forEach(List<I> instancesForOp, Consumer<? super I> consumer) {
         instancesForOp.forEach(consumer);
     }
 
-    public void parallelForEach(IIsolatedExecutor.SerializableConsumer<? super I> consumer, long timeout, TimeUnit unit)
-    {
+    public void parallelForEach(
+        IIsolatedExecutor.SerializableConsumer<? super I> consumer,
+        long timeout,
+        TimeUnit unit
+    ) {
         parallelForEach(instances, consumer, timeout, unit);
     }
 
-    public void parallelForEach(List<I> instances, IIsolatedExecutor.SerializableConsumer<? super I> consumer, long timeout, TimeUnit unit)
-    {
-        FBUtilities.waitOnFutures(instances.stream()
-                                           .map(i -> i.async(consumer).apply(i))
-                                           .collect(Collectors.toList()),
-                                  timeout, unit);
+    public void parallelForEach(
+        List<I> instances,
+        IIsolatedExecutor.SerializableConsumer<? super I> consumer,
+        long timeout,
+        TimeUnit unit
+    ) {
+        FBUtilities.waitOnFutures(
+            instances
+                .stream()
+                .map(i -> i.async(consumer).apply(i))
+                .collect(Collectors.toList()),
+            timeout,
+            unit
+        );
     }
 
-    public IMessageFilters filters()
-    {
+    public IMessageFilters filters() {
         return filters;
     }
 
-    public synchronized void setMessageSink(IMessageSink sink)
-    {
-        if (messageSink != null && sink != null)
-            throw new IllegalStateException();
+    public synchronized void setMessageSink(IMessageSink sink) {
+        if (
+            messageSink != null && sink != null
+        ) throw new IllegalStateException();
         this.messageSink = sink;
     }
 
-    public void deliverMessage(InetSocketAddress to, IMessage message)
-    {
+    public void deliverMessage(InetSocketAddress to, IMessage message) {
         IMessageSink sink = messageSink;
-        if (sink == null)
-        {
+        if (sink == null) {
             I i = get(to);
-            if (i != null)
-                i.receiveMessage(message);
-        }
-        else sink.accept(to, message);
+            if (i != null) i.receiveMessage(message);
+        } else sink.accept(to, message);
     }
 
-    public IMessageFilters.Builder verbs(Verb... verbs)
-    {
+    public IMessageFilters.Builder verbs(Verb... verbs) {
         int[] ids = new int[verbs.length];
-        for (int i = 0; i < verbs.length; ++i)
-            ids[i] = verbs[i].id;
+        for (int i = 0; i < verbs.length; ++i) ids[i] = verbs[i].id;
         return filters.verbs(ids);
     }
 
-    public void disableAutoCompaction(String keyspace)
-    {
-        forEach((i) -> i.nodetool("disableautocompaction", keyspace));
+    public void disableAutoCompaction(String keyspace) {
+        forEach(i -> i.nodetool("disableautocompaction", keyspace));
     }
 
-    public void schemaChange(String query)
-    {
+    public void schemaChange(String query) {
         schemaChange(query, false);
     }
 
@@ -876,63 +998,84 @@ public abstract class AbstractCluster<I extends IInstance> implements ICluster<I
      * re-synchronize somehow (by gossip or some other mechanism).
      * @param query Schema altering statement
      */
-    public void schemaChangeIgnoringStoppedInstances(String query)
-    {
+    public void schemaChangeIgnoringStoppedInstances(String query) {
         schemaChange(query, true);
     }
 
-    private void schemaChange(String query, boolean ignoreStoppedInstances)
-    {
-        I instance = ignoreStoppedInstances ? getFirstRunningInstance() : get(1);
+    private void schemaChange(String query, boolean ignoreStoppedInstances) {
+        I instance = ignoreStoppedInstances
+            ? getFirstRunningInstance()
+            : get(1);
         schemaChange(query, ignoreStoppedInstances, instance);
     }
 
-    public void schemaChange(String query, boolean ignoreStoppedInstances, I instance)
-    {
-        schemaChange(query, ignoreStoppedInstances, instance, SchemaChangeMonitor.DEFAULT_WAIT_SECONDS, TimeUnit.SECONDS);
+    public void schemaChange(
+        String query,
+        boolean ignoreStoppedInstances,
+        I instance
+    ) {
+        schemaChange(
+            query,
+            ignoreStoppedInstances,
+            instance,
+            SchemaChangeMonitor.DEFAULT_WAIT_SECONDS,
+            TimeUnit.SECONDS
+        );
     }
 
-    public void schemaChange(String query, boolean ignoreStoppedInstances, I instance, int waitSchemaAgreementAmount, TimeUnit unit)
-    {
-        instance.sync(() -> {
-            try (SchemaChangeMonitor monitor = new SchemaChangeMonitor(waitSchemaAgreementAmount, unit))
-            {
-                if (ignoreStoppedInstances)
-                    monitor.ignoreStoppedInstances();
-                monitor.startPolling();
+    public void schemaChange(
+        String query,
+        boolean ignoreStoppedInstances,
+        I instance,
+        int waitSchemaAgreementAmount,
+        TimeUnit unit
+    ) {
+        instance
+            .sync(() -> {
+                try (
+                    SchemaChangeMonitor monitor = new SchemaChangeMonitor(
+                        waitSchemaAgreementAmount,
+                        unit
+                    )
+                ) {
+                    if (
+                        ignoreStoppedInstances
+                    ) monitor.ignoreStoppedInstances();
+                    monitor.startPolling();
 
-                // execute the schema change
-                instance.coordinator().execute(query, ConsistencyLevel.ALL);
-                monitor.waitForCompletion();
-            }
-        }).run();
+                    // execute the schema change
+                    instance.coordinator().execute(query, ConsistencyLevel.ALL);
+                    monitor.waitForCompletion();
+                }
+            })
+            .run();
     }
 
-    public void schemaChange(String statement, int instance)
-    {
+    public void schemaChange(String statement, int instance) {
         get(instance).schemaChangeInternal(statement);
     }
 
-    private void updateMessagingVersions()
-    {
-        for (IInstance reportTo : instances)
-        {
-            if (reportTo.isShutdown())
-                continue;
+    private void updateMessagingVersions() {
+        for (IInstance reportTo : instances) {
+            if (reportTo.isShutdown()) continue;
 
-            for (IInstance reportFrom : instances)
-            {
-                if (reportFrom == reportTo || reportFrom.isShutdown())
-                    continue;
+            for (IInstance reportFrom : instances) {
+                if (reportFrom == reportTo || reportFrom.isShutdown()) continue;
 
-                int minVersion = Math.min(reportFrom.getMessagingVersion(), reportTo.getMessagingVersion());
-                reportTo.setMessagingVersion(reportFrom.broadcastAddress(), minVersion);
+                int minVersion = Math.min(
+                    reportFrom.getMessagingVersion(),
+                    reportTo.getMessagingVersion()
+                );
+                reportTo.setMessagingVersion(
+                    reportFrom.broadcastAddress(),
+                    minVersion
+                );
             }
         }
     }
 
-    public abstract class ChangeMonitor implements AutoCloseable
-    {
+    public abstract class ChangeMonitor implements AutoCloseable {
+
         final List<IListen.Cancel> cleanup;
         final Condition completed;
         private final long timeOut;
@@ -940,8 +1083,7 @@ public abstract class AbstractCluster<I extends IInstance> implements ICluster<I
         protected Predicate<IInstance> instanceFilter;
         volatile boolean initialized;
 
-        public ChangeMonitor(long timeOut, TimeUnit timeoutUnit)
-        {
+        public ChangeMonitor(long timeOut, TimeUnit timeoutUnit) {
             this.timeOut = timeOut;
             this.timeoutUnit = timeoutUnit;
             this.instanceFilter = i -> true;
@@ -949,43 +1091,42 @@ public abstract class AbstractCluster<I extends IInstance> implements ICluster<I
             this.completed = newOneTimeCondition();
         }
 
-        public void ignoreStoppedInstances()
-        {
+        public void ignoreStoppedInstances() {
             instanceFilter = instanceFilter.and(i -> !i.isShutdown());
         }
 
-        protected void signal()
-        {
-            if (initialized && !completed.isSignalled() && isCompleted())
-                completed.signalAll();
+        protected void signal() {
+            if (
+                initialized && !completed.isSignalled() && isCompleted()
+            ) completed.signalAll();
         }
 
         @Override
-        public void close()
-        {
-            for (IListen.Cancel cancel : cleanup)
-                cancel.cancel();
+        public void close() {
+            for (IListen.Cancel cancel : cleanup) cancel.cancel();
         }
 
-        public void waitForCompletion()
-        {
+        public void waitForCompletion() {
             initialized = true;
             signal();
-            try
-            {
+            try {
                 // Looks like very seldom we may start listening on `completed` after we have already signalled.
-                if (!completed.await(timeOut, timeoutUnit) && !isCompleted())
-                    throw new IllegalStateException(getMonitorTimeoutMessage());
-            }
-            catch (InterruptedException e)
-            {
-                throw new IllegalStateException("Caught exception while waiting for completion", e);
+                if (
+                    !completed.await(timeOut, timeoutUnit) && !isCompleted()
+                ) throw new IllegalStateException(getMonitorTimeoutMessage());
+            } catch (InterruptedException e) {
+                throw new IllegalStateException(
+                    "Caught exception while waiting for completion",
+                    e
+                );
             }
         }
 
-        protected void startPolling()
-        {
-            instances.stream().filter(instanceFilter).forEach(instance -> cleanup.add(startPolling(instance)));
+        protected void startPolling() {
+            instances
+                .stream()
+                .filter(instanceFilter)
+                .forEach(instance -> cleanup.add(startPolling(instance)));
         }
 
         protected abstract IListen.Cancel startPolling(IInstance instance);
@@ -994,7 +1135,6 @@ public abstract class AbstractCluster<I extends IInstance> implements ICluster<I
 
         protected abstract String getMonitorTimeoutMessage();
     }
-
 
     /**
      * Will wait for a schema change AND agreement that occurs after it is created
@@ -1006,67 +1146,75 @@ public abstract class AbstractCluster<I extends IInstance> implements ICluster<I
      * <p>
      * This could perhaps be made a little more robust, but this should more than suffice.
      */
-    public class SchemaChangeMonitor extends ChangeMonitor
-    {
-        // See CASSANDRA-18707
-        static final public int DEFAULT_WAIT_SECONDS = 120;
+    public class SchemaChangeMonitor extends ChangeMonitor {
 
-        public SchemaChangeMonitor()
-        {
+        // See CASSANDRA-18707
+        public static final int DEFAULT_WAIT_SECONDS = 120;
+
+        public SchemaChangeMonitor() {
             super(DEFAULT_WAIT_SECONDS, TimeUnit.SECONDS);
         }
 
-        public SchemaChangeMonitor(int waitAmount, TimeUnit unit)
-        {
+        public SchemaChangeMonitor(int waitAmount, TimeUnit unit) {
             super(waitAmount, unit);
         }
 
-        protected IListen.Cancel startPolling(IInstance instance)
-        {
+        protected IListen.Cancel startPolling(IInstance instance) {
             return instance.listen().schema(this::signal);
         }
 
-        protected boolean isCompleted()
-        {
-            return 1 == instances.stream().filter(instanceFilter).map(IInstance::schemaVersion).distinct().count();
+        protected boolean isCompleted() {
+            return (
+                1 ==
+                instances
+                    .stream()
+                    .filter(instanceFilter)
+                    .map(IInstance::schemaVersion)
+                    .distinct()
+                    .count()
+            );
         }
 
-        protected String getMonitorTimeoutMessage()
-        {
-            return String.format("Schema agreement not reached. Schema versions of the instances: %s",
-                                 instances.stream().map(IInstance::schemaVersion).collect(Collectors.toList()));
+        protected String getMonitorTimeoutMessage() {
+            return String.format(
+                "Schema agreement not reached. Schema versions of the instances: %s",
+                instances
+                    .stream()
+                    .map(IInstance::schemaVersion)
+                    .collect(Collectors.toList())
+            );
         }
     }
 
-    public class AllMembersAliveMonitor extends ChangeMonitor
-    {
-        public AllMembersAliveMonitor()
-        {
+    public class AllMembersAliveMonitor extends ChangeMonitor {
+
+        public AllMembersAliveMonitor() {
             super(60, TimeUnit.SECONDS);
         }
 
-        protected IListen.Cancel startPolling(IInstance instance)
-        {
+        protected IListen.Cancel startPolling(IInstance instance) {
             return instance.listen().liveMembers(this::signal);
         }
 
-        protected boolean isCompleted()
-        {
-            return instances.stream().allMatch(i -> !i.config().has(Feature.GOSSIP) || i.liveMemberCount() == instances.size());
+        protected boolean isCompleted() {
+            return instances
+                .stream()
+                .allMatch(
+                    i ->
+                        !i.config().has(Feature.GOSSIP) ||
+                        i.liveMemberCount() == instances.size()
+                );
         }
 
-        protected String getMonitorTimeoutMessage()
-        {
+        protected String getMonitorTimeoutMessage() {
             return "Live member count did not converge across all instances";
         }
     }
 
-    public void startup()
-    {
+    public void startup() {
         // start the JNA cleaner on the system class loader to avoid pinning an instance
         com.sun.jna.internal.Cleaner.getCleaner();
-        try (AllMembersAliveMonitor monitor = new AllMembersAliveMonitor())
-        {
+        try (AllMembersAliveMonitor monitor = new AllMembersAliveMonitor()) {
             monitor.startPolling();
 
             // Start any instances with auto_bootstrap enabled first, and in series to avoid issues
@@ -1075,47 +1223,52 @@ public abstract class AbstractCluster<I extends IInstance> implements ICluster<I
             // Whichever instance starts first will be the initial CMS for the cluster.
             List<I> startSequentially = new ArrayList<>();
             List<I> startParallel = new ArrayList<>();
-            for (int i = 0; i < instances.size(); i++)
-            {
+            for (int i = 0; i < instances.size(); i++) {
                 I instance = instances.get(i);
 
-                if ((boolean) instance.config().get("auto_bootstrap"))
-                    startSequentially.add(instance);
-                else
-                    startParallel.add(instance);
+                if (
+                    (boolean) instance.config().get("auto_bootstrap")
+                ) startSequentially.add(instance);
+                else startParallel.add(instance);
             }
 
             // If no instances have auto_bootstrap enabled, start the first in the list
             // so it can become the initial CMS member.
-            if (startSequentially.isEmpty())
-                startSequentially.add(startParallel.remove(0));
+            if (startSequentially.isEmpty()) startSequentially.add(
+                startParallel.remove(0)
+            );
 
             forEach(startSequentially, i -> {
                 i.startup(this);
             });
-            parallelForEach(startParallel, i -> {
-                i.startup(this);
-            }, 0, null);
+            parallelForEach(
+                startParallel,
+                i -> {
+                    i.startup(this);
+                },
+                0,
+                null
+            );
             parallelForEach(instances, IInstance::postStartup, 0, null);
             monitor.waitForCompletion();
         }
     }
 
-    private void uncaughtException(I instance, Thread thread, Throwable error)
-    {
+    private void uncaughtException(I instance, Thread thread, Throwable error) {
         // should no longer be possible given this is called from a ThreadGroup, but just in case
-        if (!(thread.getContextClassLoader() instanceof InstanceClassLoader))
-            return;
+        if (
+            !(thread.getContextClassLoader() instanceof InstanceClassLoader)
+        ) return;
 
-        try
-        {
+        try {
             instance.uncaughtException(thread, error);
-        }
-        catch (Throwable t)
-        {
+        } catch (Throwable t) {
             // mixing ClassLoaders so can't use normal instanceOf check
-            if (AssertionUtils.isInstanceof(InstanceKiller.InstanceShutdown.class).matches(Throwables.getRootCause(t)))
-            {
+            if (
+                AssertionUtils.isInstanceof(
+                    InstanceKiller.InstanceShutdown.class
+                ).matches(Throwables.getRootCause(t))
+            ) {
                 // The exception was handled by JVMStabilityInspector
                 return;
             }
@@ -1125,42 +1278,41 @@ public abstract class AbstractCluster<I extends IInstance> implements ICluster<I
         maybeAddUncaughtExceptions(error, instance);
     }
 
-    private void maybeAddUncaughtExceptions(Throwable error, I instance)
-    {
+    private void maybeAddUncaughtExceptions(Throwable error, I instance) {
         BiPredicate<Integer, Throwable> ignore = ignoreUncaughtThrowable;
-        if ((ignore == null || !ignore.test(instance.config().num(), error)) && instance != null && !instance.isShutdown())
-            uncaughtExceptions.add(error);
+        if (
+            (ignore == null || !ignore.test(instance.config().num(), error)) &&
+            instance != null &&
+            !instance.isShutdown()
+        ) uncaughtExceptions.add(error);
     }
 
     @Override
-    public void setUncaughtExceptionsFilter(BiPredicate<Integer, Throwable> ignoreUncaughtThrowable)
-    {
+    public void setUncaughtExceptionsFilter(
+        BiPredicate<Integer, Throwable> ignoreUncaughtThrowable
+    ) {
         this.ignoreUncaughtThrowable = ignoreUncaughtThrowable;
     }
 
     @Override
-    public void close()
-    {
+    public void close() {
         // Make sure that a nodetool call is not preventing us from stopping the instance
-        System.setSecurityManager(null);
+        // System.setSecurityManager(null);
 
         logger.info("Closing cluster {}", this.clusterId);
         FBUtilities.closeQuietly(instanceInitializer);
 
         List<Future<?>> futures = new ArrayList<>();
-        futures = instances.stream()
-                           .filter(i -> !i.isShutdown())
-                           .map(IInstance::shutdown)
-                           .collect(Collectors.toList());
-        try
-        {
+        futures = instances
+            .stream()
+            .filter(i -> !i.isShutdown())
+            .map(IInstance::shutdown)
+            .collect(Collectors.toList());
+        try {
             FBUtilities.waitOnFutures(futures, 1L, TimeUnit.MINUTES);
-        }
-        catch (Throwable t)
-        {
+        } catch (Throwable t) {
             IllegalStateException leak = checkForThreadLeaks();
-            if (leak != null)
-            {
+            if (leak != null) {
                 leak.initCause(t);
                 throw leak;
             }
@@ -1170,25 +1322,25 @@ public abstract class AbstractCluster<I extends IInstance> implements ICluster<I
         instanceMap.clear();
         PathUtils.setDeletionListener(ignore -> {});
         // Make sure to only delete directory when threads are stopped
-        if (Files.exists(root) && futures.stream().allMatch(f -> f.isDone()))
-            PathUtils.deleteRecursive(root);
-        else
-            logger.error("Not removing directories, as some instances haven't fully stopped.");
+        if (
+            Files.exists(root) && futures.stream().allMatch(f -> f.isDone())
+        ) PathUtils.deleteRecursive(root);
+        else logger.error(
+            "Not removing directories, as some instances haven't fully stopped."
+        );
         checkAndResetUncaughtExceptions();
         //checkForThreadLeaks();
         //withThreadLeakCheck(futures);
     }
 
     @Override
-    public void checkAndResetUncaughtExceptions()
-    {
+    public void checkAndResetUncaughtExceptions() {
         List<Throwable> drain = new ArrayList<>(uncaughtExceptions.size());
         uncaughtExceptions.removeIf(e -> {
             drain.add(e);
             return true;
         });
-        if (!drain.isEmpty())
-        {
+        if (!drain.isEmpty()) {
             ShutdownException shutdownException = new ShutdownException(drain);
             // also log as java will truncate log lists
             logger.error("Unexpected errors", shutdownException);
@@ -1197,260 +1349,382 @@ public abstract class AbstractCluster<I extends IInstance> implements ICluster<I
     }
 
     @Nullable
-    private IllegalStateException checkForThreadLeaks()
-    {
+    private IllegalStateException checkForThreadLeaks() {
         //This is an alternate version of the thread leak check that just checks to see if any threads are still alive
         // with the context classloader.
-        Map<Thread, StackTraceElement[]> allThreads = Thread.getAllStackTraces();
-        var groupByStacktrace = LinkedHashMultimap.<List<StackTraceElement>, String>create();
-        for (Map.Entry<Thread, StackTraceElement[]> e : allThreads.entrySet())
-        {
-
-            if (!(e.getKey().getContextClassLoader() instanceof InstanceClassLoader)) continue;
+        Map<Thread, StackTraceElement[]> allThreads =
+            Thread.getAllStackTraces();
+        var groupByStacktrace = LinkedHashMultimap.<
+                List<StackTraceElement>,
+                String
+            >create();
+        for (Map.Entry<Thread, StackTraceElement[]> e : allThreads.entrySet()) {
+            if (
+                !(e.getKey().getContextClassLoader() instanceof
+                    InstanceClassLoader)
+            ) continue;
             e.getKey().setContextClassLoader(null);
-            groupByStacktrace.put(Arrays.asList(e.getValue()), e.getKey().getName());
+            groupByStacktrace.put(
+                Arrays.asList(e.getValue()),
+                e.getKey().getName()
+            );
         }
         if (groupByStacktrace.isEmpty()) return null;
         StringBuilder sb = new StringBuilder();
-        for (Map.Entry<List<StackTraceElement>, Collection<String>> e : groupByStacktrace.asMap().entrySet())
-        {
+        for (Map.Entry<
+            List<StackTraceElement>,
+            Collection<String>
+        > e : groupByStacktrace.asMap().entrySet()) {
             sb.append("Threads: ").append(e.getValue()).append(":\n");
-            for (StackTraceElement s : e.getKey())
-                sb.append("\t").append(s).append("\n");
+            for (StackTraceElement s : e.getKey()) sb
+                .append("\t")
+                .append(s)
+                .append("\n");
         }
-        return new IllegalStateException("Unterminated threads detected; active threads:\n" + sb);
+        return new IllegalStateException(
+            "Unterminated threads detected; active threads:\n" + sb
+        );
     }
 
-    public List<Token> tokens()
-    {
+    public List<Token> tokens() {
         return stream()
-               .flatMap(i ->
-                    {
-                        try
-                        {
-                            IPartitioner partitioner = FBUtilities.newPartitioner(i.config().getString("partitioner"));
-                            return Stream.of(i.config().getString("initial_token").split(",")).map(partitioner.getTokenFactory()::fromString);
-                        }
-                        catch (Throwable t)
-                        {
-                            throw new RuntimeException(t);
-                        }
-                    })
-               .collect(Collectors.toList());
+            .flatMap(i -> {
+                try {
+                    IPartitioner partitioner = FBUtilities.newPartitioner(
+                        i.config().getString("partitioner")
+                    );
+                    return Stream.of(
+                        i.config().getString("initial_token").split(",")
+                    ).map(partitioner.getTokenFactory()::fromString);
+                } catch (Throwable t) {
+                    throw new RuntimeException(t);
+                }
+            })
+            .collect(Collectors.toList());
     }
 
-    private static Set<String> findClassesMarkedForSharedClassLoader(Class<?>[] share, Shared.Scope ... scopes)
-    {
-        return findClassesMarkedForSharedClassLoader(share, ImmutableSet.copyOf(scopes)::contains);
+    private static Set<String> findClassesMarkedForSharedClassLoader(
+        Class<?>[] share,
+        Shared.Scope... scopes
+    ) {
+        return findClassesMarkedForSharedClassLoader(
+            share,
+            ImmutableSet.copyOf(scopes)::contains
+        );
     }
 
-    private static Set<String> findClassesMarkedForSharedClassLoader(Class<?>[] share, Predicate<Shared.Scope> scopes)
-    {
-        Set<Class<?>> classes = findClassesMarkedWith(Shared.class, a -> of(a.scope()).anyMatch(scopes));
+    private static Set<String> findClassesMarkedForSharedClassLoader(
+        Class<?>[] share,
+        Predicate<Shared.Scope> scopes
+    ) {
+        Set<Class<?>> classes = findClassesMarkedWith(Shared.class, a ->
+            of(a.scope()).anyMatch(scopes)
+        );
         Collections.addAll(classes, share);
         assertTransitiveClosure(classes);
         return toNames(classes);
     }
 
-    private static Set<String> findClassesMarkedForInstanceClassLoader(Class<?>[] isolate)
-    {
-        Set<Class<?>> classes = findClassesMarkedWith(Isolated.class, ignore -> true);
+    private static Set<String> findClassesMarkedForInstanceClassLoader(
+        Class<?>[] isolate
+    ) {
+        Set<Class<?>> classes = findClassesMarkedWith(Isolated.class, ignore ->
+            true
+        );
         Collections.addAll(classes, isolate);
         return toNames(classes);
     }
 
-    public static Predicate<String> getSharedClassPredicate(Shared.Scope ... scopes)
-    {
+    public static Predicate<String> getSharedClassPredicate(
+        Shared.Scope... scopes
+    ) {
         return getSharedClassPredicate(new Class[0], new Class[0], scopes);
     }
 
-    public static Predicate<String> getSharedClassPredicate(Class<?>[] isolate, Class<?>[] share, Shared.Scope ... scopes)
-    {
-        Set<String> shared = findClassesMarkedForSharedClassLoader(share, scopes);
+    public static Predicate<String> getSharedClassPredicate(
+        Class<?>[] isolate,
+        Class<?>[] share,
+        Shared.Scope... scopes
+    ) {
+        Set<String> shared = findClassesMarkedForSharedClassLoader(
+            share,
+            scopes
+        );
         Set<String> isolated = findClassesMarkedForInstanceClassLoader(isolate);
         return s -> {
-            if (isolated.contains(s))
-                return false;
+            if (isolated.contains(s)) return false;
 
-            return shared.contains(s) ||
-                   InstanceClassLoader.getDefaultLoadSharedFilter().test(s)
-                    || s.startsWith("org.jboss.byteman.");
+            return (
+                shared.contains(s) ||
+                InstanceClassLoader.getDefaultLoadSharedFilter().test(s) ||
+                s.startsWith("org.jboss.byteman.")
+            );
         };
     }
 
-    private static <A extends Annotation> Set<Class<?>> findClassesMarkedWith(Class<A> annotation, Predicate<A> testAnnotation)
-    {
-        Reflections reflections = new Reflections(ConfigurationBuilder.build("org.apache.cassandra").setExpandSuperTypes(false));
-        return Utils.INSTANCE.forNames(reflections.get(Scanners.TypesAnnotated.get(annotation.getName())),
-                                       reflections.getConfiguration().getClassLoaders())
-                             .stream()
-                             .filter(testAnnotation(annotation, testAnnotation))
-                             .flatMap(expander())
-                             .collect(Collectors.toSet());
+    private static <A extends Annotation> Set<Class<?>> findClassesMarkedWith(
+        Class<A> annotation,
+        Predicate<A> testAnnotation
+    ) {
+        Reflections reflections = new Reflections(
+            ConfigurationBuilder.build(
+                "org.apache.cassandra"
+            ).setExpandSuperTypes(false)
+        );
+        return Utils.INSTANCE.forNames(
+            reflections.get(Scanners.TypesAnnotated.get(annotation.getName())),
+            reflections.getConfiguration().getClassLoaders()
+        )
+            .stream()
+            .filter(testAnnotation(annotation, testAnnotation))
+            .flatMap(expander())
+            .collect(Collectors.toSet());
     }
 
-    private static Set<String> toNames(Set<Class<?>> classes)
-    {
+    private static Set<String> toNames(Set<Class<?>> classes) {
         return classes.stream().map(Class::getName).collect(Collectors.toSet());
     }
 
-    private static <A extends Annotation> Predicate<Class<?>> testAnnotation(Class<A> annotation, Predicate<A> test)
-    {
+    private static <A extends Annotation> Predicate<Class<?>> testAnnotation(
+        Class<A> annotation,
+        Predicate<A> test
+    ) {
         return clazz -> {
             A[] annotations = clazz.getDeclaredAnnotationsByType(annotation);
-            for (A a : annotations)
-            {
-                if (!test.test(a))
-                    return false;
+            for (A a : annotations) {
+                if (!test.test(a)) return false;
             }
             return true;
         };
     }
 
-    private static void assertTransitiveClosure(Set<Class<?>> classes)
-    {
+    private static void assertTransitiveClosure(Set<Class<?>> classes) {
         Set<Class<?>> tested = new HashSet<>();
-        for (Class<?> clazz : classes)
-        {
-            forEach(test -> {
-                if (!classes.contains(test))
-                    throw new AssertionError(clazz.getName() + " is shared, but its dependency " + test + " is not");
-            }, new SharedParams(ALL, ALL, NONE), clazz, tested);
+        for (Class<?> clazz : classes) {
+            forEach(
+                test -> {
+                    if (!classes.contains(test)) throw new AssertionError(
+                        clazz.getName() +
+                        " is shared, but its dependency " +
+                        test +
+                        " is not"
+                    );
+                },
+                new SharedParams(ALL, ALL, NONE),
+                clazz,
+                tested
+            );
         }
     }
 
-    private static class SharedParams
-    {
+    private static class SharedParams {
+
         final Recursive ancestors, members, inner;
 
-        private SharedParams(Recursive ancestors, Recursive members, Recursive inner)
-        {
+        private SharedParams(
+            Recursive ancestors,
+            Recursive members,
+            Recursive inner
+        ) {
             this.ancestors = ancestors;
             this.members = members;
             this.inner = inner;
         }
 
-        private SharedParams(Shared shared)
-        {
+        private SharedParams(Shared shared) {
             this.ancestors = shared.ancestors();
             this.members = shared.members();
             this.inner = shared.inner();
         }
     }
 
-    private static void forEach(Consumer<Class<?>> forEach, SharedParams shared, Class<?> cur, Set<Class<?>> done)
-    {
-        if (null == (cur = consider(cur, done)))
-            return;
+    private static void forEach(
+        Consumer<Class<?>> forEach,
+        SharedParams shared,
+        Class<?> cur,
+        Set<Class<?>> done
+    ) {
+        if (null == (cur = consider(cur, done))) return;
 
         forEach.accept(cur);
 
-        switch (shared.ancestors)
-        {
+        switch (shared.ancestors) {
             case ALL:
                 forEach(forEach, shared, cur.getSuperclass(), done);
             case INTERFACES:
-                for (Class<?> i : cur.getInterfaces())
-                    forEach(forEach, shared, i, done);
+                for (Class<?> i : cur.getInterfaces()) forEach(
+                    forEach,
+                    shared,
+                    i,
+                    done
+                );
         }
 
-        if (shared.members != NONE)
-        {
-            for (Field field : cur.getDeclaredFields())
-            {
-                if ((field.getModifiers() & Modifier.PRIVATE) == 0)
-                    forEachMatch(shared.members, forEach, shared, field.getType(), done);
+        if (shared.members != NONE) {
+            for (Field field : cur.getDeclaredFields()) {
+                if (
+                    (field.getModifiers() & Modifier.PRIVATE) == 0
+                ) forEachMatch(
+                    shared.members,
+                    forEach,
+                    shared,
+                    field.getType(),
+                    done
+                );
             }
 
-            for (Method method : cur.getDeclaredMethods())
-            {
-                if ((method.getModifiers() & Modifier.PRIVATE) == 0)
-                {
-                    forEachMatch(shared.members, forEach, shared, method.getReturnType(), done);
-                    forEachMatch(shared.members, forEach, shared, method.getParameterTypes(), done);
+            for (Method method : cur.getDeclaredMethods()) {
+                if ((method.getModifiers() & Modifier.PRIVATE) == 0) {
+                    forEachMatch(
+                        shared.members,
+                        forEach,
+                        shared,
+                        method.getReturnType(),
+                        done
+                    );
+                    forEachMatch(
+                        shared.members,
+                        forEach,
+                        shared,
+                        method.getParameterTypes(),
+                        done
+                    );
                 }
             }
         }
 
-        if (shared.inner != NONE)
-            forEachMatch(shared.inner, forEach, shared, cur.getDeclaredClasses(), done);
+        if (shared.inner != NONE) forEachMatch(
+            shared.inner,
+            forEach,
+            shared,
+            cur.getDeclaredClasses(),
+            done
+        );
     }
 
-    private static void forEachMatch(Recursive ifMatches, Consumer<Class<?>> forEach, SharedParams shared, Class<?>[] classes, Set<Class<?>> done)
-    {
-        for (Class<?> cur : classes)
-            forEachMatch(ifMatches, forEach, shared, cur, done);
+    private static void forEachMatch(
+        Recursive ifMatches,
+        Consumer<Class<?>> forEach,
+        SharedParams shared,
+        Class<?>[] classes,
+        Set<Class<?>> done
+    ) {
+        for (Class<?> cur : classes) forEachMatch(
+            ifMatches,
+            forEach,
+            shared,
+            cur,
+            done
+        );
     }
 
-    private static void forEachMatch(Recursive ifMatches, Consumer<Class<?>> forEach, SharedParams shared, Class<?> cur, Set<Class<?>> done)
-    {
-        if (ifMatches == ALL || isInterface(cur))
-            forEach(forEach, shared, cur, done);
+    private static void forEachMatch(
+        Recursive ifMatches,
+        Consumer<Class<?>> forEach,
+        SharedParams shared,
+        Class<?> cur,
+        Set<Class<?>> done
+    ) {
+        if (ifMatches == ALL || isInterface(cur)) forEach(
+            forEach,
+            shared,
+            cur,
+            done
+        );
     }
 
-    private static boolean isInterface(Class<?> test)
-    {
-        return test.isInterface() || test.isEnum() || Throwable.class.isAssignableFrom(test);
+    private static boolean isInterface(Class<?> test) {
+        return (
+            test.isInterface() ||
+            test.isEnum() ||
+            Throwable.class.isAssignableFrom(test)
+        );
     }
 
-    private static Function<Class<?>, Stream<Class<?>>> expander()
-    {
+    private static Function<Class<?>, Stream<Class<?>>> expander() {
         Set<Class<?>> done = new HashSet<>();
         return clazz -> expand(clazz, done);
     }
 
-    private static Stream<Class<?>> expand(Class<?> clazz, Set<Class<?>> done)
-    {
-        Optional<Shared> maybeShared = of(clazz.getDeclaredAnnotationsByType(Shared.class)).findFirst();
-        if (!maybeShared.isPresent())
-            return Stream.of(clazz);
+    private static Stream<Class<?>> expand(Class<?> clazz, Set<Class<?>> done) {
+        Optional<Shared> maybeShared = of(
+            clazz.getDeclaredAnnotationsByType(Shared.class)
+        ).findFirst();
+        if (!maybeShared.isPresent()) return Stream.of(clazz);
 
         Shared shared = maybeShared.get();
-        if (shared.inner() == NONE && shared.members() == NONE && shared.ancestors() == NONE)
-            return Stream.of(clazz);
+        if (
+            shared.inner() == NONE &&
+            shared.members() == NONE &&
+            shared.ancestors() == NONE
+        ) return Stream.of(clazz);
 
         Set<Class<?>> closure = new HashSet<>();
         forEach(closure::add, new SharedParams(shared), clazz, done);
         return closure.stream();
     }
 
-    private static Class<?> consider(Class<?> consider, Set<Class<?>> considered)
-    {
+    private static Class<?> consider(
+        Class<?> consider,
+        Set<Class<?>> considered
+    ) {
         if (consider == null) return null;
-        while (consider.isArray()) // TODO (future): this is inadequate handling of array types (fine for now)
-            consider = consider.getComponentType();
+        while (
+            consider.isArray()
+        ) consider = consider.getComponentType(); // TODO (future): this is inadequate handling of array types (fine for now)
 
         if (consider.isPrimitive()) return null;
-        if (consider.getPackage() != null && consider.getPackage().getName().startsWith("java.")) return null;
+        if (
+            consider.getPackage() != null &&
+            consider.getPackage().getName().startsWith("java.")
+        ) return null;
         if (!considered.add(consider)) return null;
-        if (InstanceClassLoader.getDefaultLoadSharedFilter().test(consider.getName())) return null;
+        if (
+            InstanceClassLoader.getDefaultLoadSharedFilter()
+                .test(consider.getName())
+        ) return null;
 
         return consider;
     }
 
     // 3.0 and earlier clusters must have unique InetAddressAndPort for each InetAddress
-    public static <I extends IInstance> Map<InetSocketAddress, I> getUniqueAddressLookup(ICluster<I> cluster)
-    {
+    public static <I extends IInstance> Map<
+        InetSocketAddress,
+        I
+    > getUniqueAddressLookup(ICluster<I> cluster) {
         return getUniqueAddressLookup(cluster, Function.identity());
     }
 
-    public static <I extends IInstance, V> Map<InetSocketAddress, V> getUniqueAddressLookup(ICluster<I> cluster, Function<I, V> function)
-    {
+    public static <I extends IInstance, V> Map<
+        InetSocketAddress,
+        V
+    > getUniqueAddressLookup(ICluster<I> cluster, Function<I, V> function) {
         Map<InetSocketAddress, V> lookup = new HashMap<>();
-        cluster.stream().forEach(instance -> {
-            InetSocketAddress address = instance.broadcastAddress();
-            if (!address.equals(instance.config().broadcastAddress()))
-                throw new IllegalStateException("addressAndPort mismatch: " + address + " vs " + instance.config().broadcastAddress());
-            V prev = lookup.put(address, function.apply(instance));
-            if (null != prev)
-                throw new IllegalStateException("This version of Cassandra does not support multiple nodes with the same InetAddress: " + address + " vs " + prev);
-        });
+        cluster
+            .stream()
+            .forEach(instance -> {
+                InetSocketAddress address = instance.broadcastAddress();
+                if (
+                    !address.equals(instance.config().broadcastAddress())
+                ) throw new IllegalStateException(
+                    "addressAndPort mismatch: " +
+                    address +
+                    " vs " +
+                    instance.config().broadcastAddress()
+                );
+                V prev = lookup.put(address, function.apply(instance));
+                if (null != prev) throw new IllegalStateException(
+                    "This version of Cassandra does not support multiple nodes with the same InetAddress: " +
+                    address +
+                    " vs " +
+                    prev
+                );
+            });
         return lookup;
     }
 
     // after upgrading a static function became an interface method, so need this class to mimic old behavior
-    private enum Utils implements NameHelper
-    {
-        INSTANCE;
+    private enum Utils implements NameHelper {
+        INSTANCE,
     }
 }

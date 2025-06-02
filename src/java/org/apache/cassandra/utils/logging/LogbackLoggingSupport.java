@@ -18,28 +18,27 @@
 
 package org.apache.cassandra.utils.logging;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.LoggerContext;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+// import ch.qos.logback.classic.spi.TurboFilterList;
+import ch.qos.logback.classic.turbo.ReconfigureOnChangeFilter;
+// import ch.qos.logback.classic.turbo.TurboFilter;
+import ch.qos.logback.classic.util.ContextInitializer;
+import ch.qos.logback.core.Appender;
+import ch.qos.logback.core.hook.DefaultShutdownHook;
+import com.google.common.collect.Maps;
 import java.security.AccessControlException;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-
-import com.google.common.collect.Maps;
 import org.apache.commons.lang3.StringUtils;
 import org.slf4j.LoggerFactory;
 
-import ch.qos.logback.classic.Level;
-import ch.qos.logback.classic.Logger;
-import ch.qos.logback.classic.LoggerContext;
-import ch.qos.logback.classic.spi.ILoggingEvent;
-import ch.qos.logback.classic.spi.TurboFilterList;
-import ch.qos.logback.classic.turbo.ReconfigureOnChangeFilter;
-import ch.qos.logback.classic.turbo.TurboFilter;
-import ch.qos.logback.classic.util.ContextInitializer;
-import ch.qos.logback.core.Appender;
-import ch.qos.logback.core.hook.DefaultShutdownHook;
-import org.apache.cassandra.security.ThreadAwareSecurityManager;
+// import org.apache.cassandra.security.ThreadAwareSecurityManager;
 
 /**
  * Encapsulates all logback-specific implementations in a central place.
@@ -47,17 +46,16 @@ import org.apache.cassandra.security.ThreadAwareSecurityManager;
  * This class MUST NOT be used directly, but only via {@link LoggingSupportFactory} which dynamically loads and
  * instantiates an appropriate implementation according to the used slf4j binding.
  */
-public class LogbackLoggingSupport implements LoggingSupport
-{
+public class LogbackLoggingSupport implements LoggingSupport {
 
-    private static final org.slf4j.Logger logger = LoggerFactory.getLogger(LogbackLoggingSupport.class);
+    private static final org.slf4j.Logger logger = LoggerFactory.getLogger(
+        LogbackLoggingSupport.class
+    );
 
     @Override
-    public void onStartup()
-    {
+    public void onStartup() {
         checkOnlyOneVirtualTableAppender(VirtualTableAppender.class);
         checkOnlyOneVirtualTableAppender(SlowQueriesAppender.class);
-
         // The default logback configuration in conf/logback.xml allows reloading the
         // configuration when the configuration file has changed (every 60 seconds by default).
         // This requires logback to use file I/O APIs. But file I/O is not allowed from UDFs.
@@ -69,125 +67,154 @@ public class LogbackLoggingSupport implements LoggingSupport
         // while executing sandboxed UDF code.
         //
         // NOTE: this is obsolte with logback versions (at least since 1.2.3)
-        Logger logbackLogger = (Logger) LoggerFactory.getLogger(ThreadAwareSecurityManager.class);
-        LoggerContext ctx = logbackLogger.getLoggerContext();
+        // Logger logbackLogger = (Logger) LoggerFactory.getLogger(
+        //     ThreadAwareSecurityManager.class
+        // );
+        // LoggerContext ctx = logbackLogger.getLoggerContext();
 
-        TurboFilterList turboFilterList = ctx.getTurboFilterList();
-        for (int i = 0; i < turboFilterList.size(); i++)
-        {
-            TurboFilter turboFilter = turboFilterList.get(i);
-            if (turboFilter instanceof ReconfigureOnChangeFilter)
-            {
-                ReconfigureOnChangeFilter reconfigureOnChangeFilter = (ReconfigureOnChangeFilter) turboFilter;
-                turboFilterList.set(i, new SMAwareReconfigureOnChangeFilter(reconfigureOnChangeFilter));
-                break;
-            }
-        }
+        // TurboFilterList turboFilterList = ctx.getTurboFilterList();
+        // for (int i = 0; i < turboFilterList.size(); i++) {
+        //     // TurboFilter turboFilter = turboFilterList.get(i);
+        //     if (turboFilter instanceof ReconfigureOnChangeFilter) {
+        //         ReconfigureOnChangeFilter reconfigureOnChangeFilter =
+        //             (ReconfigureOnChangeFilter) turboFilter;
+        //         turboFilterList.set(
+        //             i,
+        //             new SMAwareReconfigureOnChangeFilter(
+        //                 reconfigureOnChangeFilter
+        //             )
+        //         );
+        //         break;
+        //     }
+        // }
     }
 
     @Override
-    public void onShutdown()
-    {
+    public void onShutdown() {
         DefaultShutdownHook logbackHook = new DefaultShutdownHook();
-        logbackHook.setContext((LoggerContext) LoggerFactory.getILoggerFactory());
+        logbackHook.setContext(
+            (LoggerContext) LoggerFactory.getILoggerFactory()
+        );
         logbackHook.run();
     }
 
     @Override
-    public void setLoggingLevel(String classQualifier, String rawLevel) throws Exception
-    {
+    public void setLoggingLevel(String classQualifier, String rawLevel)
+        throws Exception {
         Logger logBackLogger = (Logger) LoggerFactory.getLogger(classQualifier);
 
         // if both classQualifier and rawLevel are empty, reload from configuration
-        if (StringUtils.isBlank(classQualifier) && StringUtils.isBlank(rawLevel))
-        {
-            LoggerContext lc = (LoggerContext) LoggerFactory.getILoggerFactory();
+        if (
+            StringUtils.isBlank(classQualifier) && StringUtils.isBlank(rawLevel)
+        ) {
+            LoggerContext lc =
+                (LoggerContext) LoggerFactory.getILoggerFactory();
             lc.reset();
             new ContextInitializer(lc).autoConfig();
             return;
         }
         // classQualifier is set, but blank level given
-        else if (StringUtils.isNotBlank(classQualifier) && StringUtils.isBlank(rawLevel))
-        {
-            if (logBackLogger.getLevel() != null || hasAppenders(logBackLogger))
-                logBackLogger.setLevel(null);
+        else if (
+            StringUtils.isNotBlank(classQualifier) &&
+            StringUtils.isBlank(rawLevel)
+        ) {
+            if (
+                logBackLogger.getLevel() != null || hasAppenders(logBackLogger)
+            ) logBackLogger.setLevel(null);
             return;
         }
 
         Level level = Level.toLevel(rawLevel);
         logBackLogger.setLevel(level);
-        logger.info("set log level to {} for classes under '{}' (if the level doesn't look like '{}' then the logger couldn't parse '{}')", level, classQualifier, rawLevel, rawLevel);
+        logger.info(
+            "set log level to {} for classes under '{}' (if the level doesn't look like '{}' then the logger couldn't parse '{}')",
+            level,
+            classQualifier,
+            rawLevel,
+            rawLevel
+        );
     }
 
     @Override
-    public Map<String, String> getLoggingLevels()
-    {
+    public Map<String, String> getLoggingLevels() {
         Map<String, String> logLevelMaps = Maps.newLinkedHashMap();
         LoggerContext lc = (LoggerContext) LoggerFactory.getILoggerFactory();
-        for (Logger logBackLogger : lc.getLoggerList())
-        {
-            if (logBackLogger.getLevel() != null || hasAppenders(logBackLogger))
-                logLevelMaps.put(logBackLogger.getName(), logBackLogger.getLevel().toString());
+        for (Logger logBackLogger : lc.getLoggerList()) {
+            if (
+                logBackLogger.getLevel() != null || hasAppenders(logBackLogger)
+            ) logLevelMaps.put(
+                logBackLogger.getName(),
+                logBackLogger.getLevel().toString()
+            );
         }
         return logLevelMaps;
     }
 
     @Override
-    public Optional<Logger> getLogger(String loggerName)
-    {
+    public Optional<Logger> getLogger(String loggerName) {
         LoggerContext lc = (LoggerContext) LoggerFactory.getILoggerFactory();
-        for (Logger logBackLogger : lc.getLoggerList())
-        {
-            if (logBackLogger.getName().equals(loggerName))
-                return Optional.of(logBackLogger);
+        for (Logger logBackLogger : lc.getLoggerList()) {
+            if (logBackLogger.getName().equals(loggerName)) return Optional.of(
+                logBackLogger
+            );
         }
 
         return Optional.empty();
     }
 
     @Override
-    public <T extends Appender<?>> Optional<T> getAppender(Class<T> appenderClass, String appenderName)
-    {
+    public <T extends Appender<?>> Optional<T> getAppender(
+        Class<T> appenderClass,
+        String appenderName
+    ) {
         LoggerContext lc = (LoggerContext) LoggerFactory.getILoggerFactory();
-        for (Logger logBackLogger : lc.getLoggerList())
-        {
-            for (Iterator<Appender<ILoggingEvent>> iterator = logBackLogger.iteratorForAppenders(); iterator.hasNext();)
-            {
+        for (Logger logBackLogger : lc.getLoggerList()) {
+            for (
+                Iterator<Appender<ILoggingEvent>> iterator =
+                    logBackLogger.iteratorForAppenders();
+                iterator.hasNext();
+            ) {
                 Appender<ILoggingEvent> appender = iterator.next();
-                if (appender.getClass() == appenderClass && appender.getName().equals(appenderName))
-                    return Optional.of(appenderClass.cast(appender));
+                if (
+                    appender.getClass() == appenderClass &&
+                    appender.getName().equals(appenderName)
+                ) return Optional.of(appenderClass.cast(appender));
             }
         }
 
         return Optional.empty();
     }
 
-    private void checkOnlyOneVirtualTableAppender(Class<?> appenderClass)
-    {
+    private void checkOnlyOneVirtualTableAppender(Class<?> appenderClass) {
         int count = 0;
         LoggerContext lc = (LoggerContext) LoggerFactory.getILoggerFactory();
         List<String> virtualAppenderNames = new ArrayList<>();
-        for (Logger logBackLogger : lc.getLoggerList())
-        {
-            for (Iterator<Appender<ILoggingEvent>> iterator = logBackLogger.iteratorForAppenders(); iterator.hasNext();)
-            {
+        for (Logger logBackLogger : lc.getLoggerList()) {
+            for (
+                Iterator<Appender<ILoggingEvent>> iterator =
+                    logBackLogger.iteratorForAppenders();
+                iterator.hasNext();
+            ) {
                 Appender<?> appender = iterator.next();
-                if (appenderClass.isAssignableFrom(appender.getClass()))
-                {
+                if (appenderClass.isAssignableFrom(appender.getClass())) {
                     virtualAppenderNames.add(appender.getName());
                     count += 1;
                 }
             }
         }
 
-        if (count > 1)
-            throw new IllegalStateException(String.format("There are multiple appenders of class %s of names %s. There is only one appender of such class allowed.",
-                                                          appenderClass.getName(), String.join(",", virtualAppenderNames)));
+        if (count > 1) throw new IllegalStateException(
+            String.format(
+                "There are multiple appenders of class %s of names %s. There is only one appender of such class allowed.",
+                appenderClass.getName(),
+                String.join(",", virtualAppenderNames)
+            )
+        );
     }
 
-    private boolean hasAppenders(Logger logBackLogger)
-    {
-        Iterator<Appender<ILoggingEvent>> it = logBackLogger.iteratorForAppenders();
+    private boolean hasAppenders(Logger logBackLogger) {
+        Iterator<Appender<ILoggingEvent>> it =
+            logBackLogger.iteratorForAppenders();
         return it.hasNext();
     }
 
@@ -198,24 +225,23 @@ public class LogbackLoggingSupport implements LoggingSupport
      * This is obsolete with logback versions that replaced {@link ReconfigureOnChangeFilter}
      * with {@link ch.qos.logback.classic.joran.ReconfigureOnChangeTask} (at least logback since 1.2.3).
      */
-    private static class SMAwareReconfigureOnChangeFilter extends ReconfigureOnChangeFilter
-    {
-        SMAwareReconfigureOnChangeFilter(ReconfigureOnChangeFilter reconfigureOnChangeFilter)
-        {
+    private static class SMAwareReconfigureOnChangeFilter
+        extends ReconfigureOnChangeFilter {
+
+        SMAwareReconfigureOnChangeFilter(
+            ReconfigureOnChangeFilter reconfigureOnChangeFilter
+        ) {
             setRefreshPeriod(reconfigureOnChangeFilter.getRefreshPeriod());
             setName(reconfigureOnChangeFilter.getName());
             setContext(reconfigureOnChangeFilter.getContext());
-            if (reconfigureOnChangeFilter.isStarted())
-            {
+            if (reconfigureOnChangeFilter.isStarted()) {
                 reconfigureOnChangeFilter.stop();
                 start();
             }
         }
 
-        protected boolean changeDetected(long now)
-        {
-            if (ThreadAwareSecurityManager.isSecuredThread())
-                return false;
+        protected boolean changeDetected(long now) {
+            // if (ThreadAwareSecurityManager.isSecuredThread()) return false;
             return super.changeDetected(now);
         }
     }
